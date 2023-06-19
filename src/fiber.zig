@@ -1,0 +1,249 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const Fiber = @This();
+
+pub const Error = error{
+    StackTooSmall,
+    StackTooLarge,
+};
+
+pub fn init(stack: []u8, comptime func: anytype, args: anytype) Error!*Fiber {
+    const Args = @TypeOf(args);
+    const state = try State.init(stack, @sizeOf(Args), struct {
+        fn entry() callconv(.C) noreturn {
+            const state = tls_state orelse unreachable;
+
+            const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
+            @call(.auto, func, args_ptr.*);
+
+            __fiber_stack_swap(&state.stack_context, &state.caller_context);
+            unreachable;
+        }
+    }.entry);
+
+    const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
+    args_ptr.* = args;
+
+    return @ptrCast(*Fiber, state);
+}
+
+threadlocal var tls_state: ?*State = null;
+
+pub inline fn current() ?*Fiber {
+    return @ptrCast(?*Fiber, tls_state);
+}
+
+pub fn getStack(fiber: *Fiber) []u8 {
+    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+
+    const stack_end = @ptrToInt(state) + @truncate(u8, state.offset);
+    const stack_base = stack_end - (state.offset >> @bitSizeOf(u8));
+    return @ptrCast([*]u8, stack_base)[0..(stack_end - stack_base)];
+}
+
+pub fn switchTo(fiber: *Fiber) void {
+    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+
+    const old_state = tls_state;
+    tls_state = state;
+    defer tls_state = old_state;
+
+    __fiber_stack_swap(&state.caller_context, &state.stack_context);
+}
+
+pub fn yield() void {
+    const state = tls_state orelse unreachable;
+    __fiber_stack_swap(&state.stack_context, &state.caller_context);
+}
+
+const State = extern struct {
+    caller_context: *anyopaque,
+    stack_context: *anyopaque,
+    offset: usize,
+
+    fn init(stack: []u8, args_size: usize, entry_point: *const fn () callconv(.C) noreturn) Error!*State {
+        const stack_base = @ptrToInt(stack.ptr);
+        const stack_end = @ptrToInt(stack.ptr + stack.len);
+        if (stack.len > (std.math.maxInt(usize) >> @bitSizeOf(u8))) return error.StackTooLarge;
+
+        // Push the State onto the state.
+        var stack_ptr = stack_end - @sizeOf(State);
+        stack_ptr = std.mem.alignBackward(stack_ptr, @alignOf(State));
+        if (stack_ptr < stack_base) return error.StackTooSmall;
+
+        const state = @intToPtr(*State, stack_ptr);
+        const end_offset = stack_end - stack_ptr;
+
+        // Push enough bytes for the args onto the stack.
+        stack_ptr -= args_size;
+        if (stack_ptr < stack_base) return error.StackTooSmall;
+
+        // Push the entry point onto the stack.
+        stack_ptr -= @sizeOf(@TypeOf(entry_point));
+        stack_ptr = std.mem.alignBackward(stack_ptr, @alignOf(@TypeOf(entry_point)));
+        if (stack_ptr < stack_base) return error.StackTooSmall;
+
+        const entry_point_ptr = @intToPtr(*@TypeOf(entry_point), stack_ptr);
+        entry_point_ptr.* = entry_point;
+
+        // "Push" data for the stack context.
+        stack_ptr -= @sizeOf(usize) * StackContext.word_count;
+        std.debug.assert(std.mem.isAligned(stack_ptr, @alignOf(usize)));
+        if (stack_ptr < stack_base) return error.StackTooSmall;
+
+        state.* = .{
+            .caller_context = undefined,
+            .stack_context = @intToPtr(*anyopaque, stack_ptr),
+            .offset = (stack.len << @bitSizeOf(u8)) | end_offset,
+        };
+
+        return state;
+    }
+};
+
+extern fn __fiber_stack_swap(
+    noalias current_context_ptr: **anyopaque,
+    noalias new_context_ptr: **anyopaque,
+) void;
+
+const StackContext = switch (builtin.cpu.arch) {
+    .x86_64 => switch (builtin.os.tag) {
+        .windows => Intel_Microsoft,
+        else => Intel_SysV,
+    },
+    .aarch64 => Arm_64,
+    else => @compileError("platform not currently supported"),
+};
+
+const Intel_Microsoft = struct {
+    pub const word_count = 30;
+
+    comptime {
+        asm(
+            \\.global __fiber_stack_swap
+            \\__fiber_stack_swap:
+            \\  pushq %gs:0x10
+            \\  pushq %gs:0x08
+            \\
+            \\  pushq %rbx
+            \\  pushq %rbp
+            \\  pushq %rdi
+            \\  pushq %rsi
+            \\  pushq %r12
+            \\  pushq %r13
+            \\  pushq %r14
+            \\  pushq %r15
+            \\
+            \\  subq $160, %rsp
+            \\  movups %xmm6, 0x00(%rsp)
+            \\  movups %xmm7, 0x10(%rsp)
+            \\  movups %xmm8, 0x20(%rsp)
+            \\  movups %xmm9, 0x30(%rsp)
+            \\  movups %xmm10, 0x40(%rsp)
+            \\  movups %xmm11, 0x50(%rsp)
+            \\  movups %xmm12, 0x60(%rsp)
+            \\  movups %xmm13, 0x70(%rsp)
+            \\  movups %xmm14, 0x80(%rsp)
+            \\  movups %xmm15, 0x90(%rsp)
+            \\
+            \\  movq %rsp, (%rcx)
+            \\  movq (%rdx), %rsp
+            \\
+            \\  movups 0x00(%rsp), %xmm6
+            \\  movups 0x10(%rsp), %xmm7
+            \\  movups 0x20(%rsp), %xmm8
+            \\  movups 0x30(%rsp), %xmm9
+            \\  movups 0x40(%rsp), %xmm10
+            \\  movups 0x50(%rsp), %xmm11
+            \\  movups 0x60(%rsp), %xmm12
+            \\  movups 0x70(%rsp), %xmm13
+            \\  movups 0x80(%rsp), %xmm14
+            \\  movups 0x90(%rsp), %xmm15
+            \\  addq $160, %rsp
+            \\
+            \\  popq %r15
+            \\  popq %r14
+            \\  popq %r13
+            \\  popq %r12
+            \\  popq %rsi
+            \\  popq %rdi
+            \\  popq %rbp
+            \\  popq %rbx
+            \\
+            \\  popq %gs:0x08
+            \\  popq %gs:0x10
+            \\  
+            \\  retq
+        );
+    }
+};
+
+const Intel_SysV = struct {
+    pub const word_count = 6;
+
+    comptime {
+        asm(
+            \\.global __fiber_stack_swap
+            \\__fiber_stack_swap:
+            \\  pushq %rbx
+            \\  pushq %rbp
+            \\  pushq %r12
+            \\  pushq %r13
+            \\  pushq %r14
+            \\  pushq %r15
+            \\
+            \\  movq %rsp, (%rdi)
+            \\  movq (%rsi), %rsp
+            \\
+            \\  popq %r15
+            \\  popq %r14
+            \\  popq %r13
+            \\  popq %r12
+            \\  popq %rbp
+            \\  popq %rbx
+            \\
+            \\  retq
+        );
+    }
+};
+
+const Arm_64 = struct {
+    pub const word_count = 20;
+
+    comptime {
+        asm(
+            \\.global __fiber_stack_swap
+            \\__fiber_stack_swap:
+            \\  stp d8, d9, [sp, #-20*8]!
+            \\  stp d10, d11, [sp, #2*8]
+            \\  stp d12, d13, [sp, #4*8]
+            \\  stp d14, d15, [sp, #6*8]
+            \\  stp x19, x20, [sp, #8*8]
+            \\  stp x21, x22, [sp, #10*8]
+            \\  stp x23, x24, [sp, #12*8]
+            \\  stp x25, x26, [sp, #14*8]
+            \\  stp x27, x28, [sp, #16*8]
+            \\  stp x29, x30, [sp, #18*8]
+            \\
+            \\  mov x16, sp
+            \\  str x16, [x0]
+            \\  ldr x16, [x1]
+            \\  mov sp, x16
+            \\
+            \\  ldp x29, x30, [sp, #18*8]
+            \\  ldp x27, x28, [sp, #16*8]
+            \\  ldp x25, x26, [sp, #14*8]
+            \\  ldp x23, x24, [sp, #12*8]
+            \\  ldp x21, x22, [sp, #10*8]
+            \\  ldp x19, x20, [sp, #8*8]
+            \\  ldp d14, d15, [sp, #6*8]
+            \\  ldp d12, d13, [sp, #4*8]
+            \\  ldp d10, d11, [sp, #2*8]
+            \\  ldp d8, d9, [sp], #20*8
+            \\
+            \\  mov x16, lr
+            \\  mov lr, zxr
+            \\  ret x16
+        );
+    }
+};
