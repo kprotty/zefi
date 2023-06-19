@@ -1,21 +1,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 const Fiber = @This();
 
 pub const Error = error{
+    /// The stack space provided to the fiber is not large enough to contain required metadata.
     StackTooSmall,
+    /// The stack space provided to the fiber is too big to be tracked by getStack().
     StackTooLarge,
 };
 
-pub fn init(stack: []u8, comptime func: anytype, args: anytype) Error!*Fiber {
+/// Intrusively allocates a Fiber object (and auxiliary data) inside (specifically, and the end of) the given stack memory.
+/// Then, execution of the fiber is setup to invoke the given function with the args on the next call to `switchTo`.''
+pub fn init(stack: []u8, user_data: usize, comptime func: anytype, args: anytype) Error!*Fiber {
     const Args = @TypeOf(args);
-    const state = try State.init(stack, @sizeOf(Args), struct {
+    const state = try State.init(stack, user_data, @sizeOf(Args), struct {
         fn entry() callconv(.C) noreturn {
             const state = tls_state orelse unreachable;
 
+            // Call the functions with the args.
             const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
             @call(.auto, func, args_ptr.*);
 
+            // Mark the fiber as completed and do one last 
             zefi_stack_swap(&state.stack_context, &state.caller_context);
             unreachable;
         }
@@ -29,10 +36,13 @@ pub fn init(stack: []u8, comptime func: anytype, args: anytype) Error!*Fiber {
 
 threadlocal var tls_state: ?*State = null;
 
+/// Get the currently running fiber of the caller, if any.
 pub inline fn current() ?*Fiber {
     return @ptrCast(?*Fiber, tls_state);
 }
 
+/// Given a fiber, return the stack memory used to initialize it.
+/// Calling getStack() on a fiber which has completed is unspecified behavior.
 pub fn getStack(fiber: *Fiber) []u8 {
     const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
 
@@ -41,16 +51,36 @@ pub fn getStack(fiber: *Fiber) []u8 {
     return @ptrCast([*]u8, stack_base)[0..(stack_end - stack_base)];
 }
 
+/// Given a fiber, return the user_data used to initialize it.
+/// A pointer to the user_data is returned to give the caller the ability to modify it on the Fiber.
+/// Calling getUserDataPtr() on a fiber which has completed is unspecified behavior.
+pub fn getUserDataPtr(fiber: *Fiber) *usize {
+    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+    return &state.user_data;
+}
+
+/// Switches the current thread's execution state from the caller's to the fiber's.
+/// The fiber will return back to this caller either through yield or completing its init function.
+/// The fiber must either be newly initialized or previously yielded.
+/// 
+/// Switching to a fiber that is currently executing is undefined behavior.
+/// Switching to a fiber that has completed is illegal behavior.
 pub fn switchTo(fiber: *Fiber) void {
     const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
 
+    // Temporarily set the current fiber to the one passed in for the duration of the stack swap.
     const old_state = tls_state;
+    assert(old_state != state);
     tls_state = state;
     defer tls_state = old_state;
 
     zefi_stack_swap(&state.caller_context, &state.stack_context);
 }
 
+/// Switches the current thread's execution back to the most recent switchTo() called on the currently running fiber.
+/// Calling yield from outside a fiber context (`current() == null`) is illegal behavior.
+/// Once execution is yielded back, switchTo() on the (now previous) current fiber can be called again 
+/// to continue the fiber from this yield point. 
 pub fn yield() void {
     const state = tls_state orelse unreachable;
     zefi_stack_swap(&state.stack_context, &state.caller_context);
@@ -59,9 +89,10 @@ pub fn yield() void {
 const State = extern struct {
     caller_context: *anyopaque,
     stack_context: *anyopaque,
+    user_data: usize,
     offset: usize,
 
-    fn init(stack: []u8, args_size: usize, entry_point: *const fn () callconv(.C) noreturn) Error!*State {
+    fn init(stack: []u8, user_data: usize, args_size: usize, entry_point: *const fn () callconv(.C) noreturn) Error!*State {
         const stack_base = @ptrToInt(stack.ptr);
         const stack_end = @ptrToInt(stack.ptr + stack.len);
         if (stack.len > (std.math.maxInt(usize) >> @bitSizeOf(u8))) return error.StackTooLarge;
@@ -84,7 +115,7 @@ const State = extern struct {
 
         // Reserve data for the StackContext.
         stack_ptr -= @sizeOf(usize) * StackContext.word_count;
-        std.debug.assert(std.mem.isAligned(stack_ptr, @alignOf(usize)));
+        assert(std.mem.isAligned(stack_ptr, @alignOf(usize)));
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
         // Write the entry point into the StackContext.
@@ -93,6 +124,7 @@ const State = extern struct {
         state.* = .{
             .caller_context = undefined,
             .stack_context = @intToPtr(*anyopaque, stack_ptr),
+            .user_data = user_data,
             .offset = (stack.len << @bitSizeOf(u8)) | end_offset,
         };
 
