@@ -16,7 +16,7 @@ pub fn init(stack: []u8, comptime func: anytype, args: anytype) Error!*Fiber {
             const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
             @call(.auto, func, args_ptr.*);
 
-            __fiber_stack_swap(&state.stack_context, &state.caller_context);
+            zefi_stack_swap(&state.stack_context, &state.caller_context);
             unreachable;
         }
     }.entry);
@@ -48,12 +48,12 @@ pub fn switchTo(fiber: *Fiber) void {
     tls_state = state;
     defer tls_state = old_state;
 
-    __fiber_stack_swap(&state.caller_context, &state.stack_context);
+    zefi_stack_swap(&state.caller_context, &state.stack_context);
 }
 
 pub fn yield() void {
     const state = tls_state orelse unreachable;
-    __fiber_stack_swap(&state.stack_context, &state.caller_context);
+    zefi_stack_swap(&state.stack_context, &state.caller_context);
 }
 
 const State = extern struct {
@@ -68,7 +68,7 @@ const State = extern struct {
 
         // Push the State onto the state.
         var stack_ptr = stack_end - @sizeOf(State);
-        stack_ptr = std.mem.alignBackward(stack_ptr, @alignOf(State));
+        stack_ptr = std.mem.alignBackward(usize, stack_ptr, @alignOf(State));
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
         const state = @intToPtr(*State, stack_ptr);
@@ -78,18 +78,17 @@ const State = extern struct {
         stack_ptr -= args_size;
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        // Push the entry point onto the stack.
-        stack_ptr -= @sizeOf(@TypeOf(entry_point));
-        stack_ptr = std.mem.alignBackward(stack_ptr, @alignOf(@TypeOf(entry_point)));
+        // Align the stack for the StackContext.
+        stack_ptr = std.mem.alignBackward(usize, stack_ptr, 16);
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        const entry_point_ptr = @intToPtr(*@TypeOf(entry_point), stack_ptr);
-        entry_point_ptr.* = entry_point;
-
-        // "Push" data for the stack context.
+        // Reserve data for the StackContext.
         stack_ptr -= @sizeOf(usize) * StackContext.word_count;
         std.debug.assert(std.mem.isAligned(stack_ptr, @alignOf(usize)));
         if (stack_ptr < stack_base) return error.StackTooSmall;
+
+        // Write the entry point into the StackContext.
+        @intToPtr([*]@TypeOf(entry_point), stack_ptr)[StackContext.entry_offset] = entry_point;
 
         state.* = .{
             .caller_context = undefined,
@@ -101,7 +100,7 @@ const State = extern struct {
     }
 };
 
-extern fn __fiber_stack_swap(
+extern fn zefi_stack_swap(
     noalias current_context_ptr: **anyopaque,
     noalias new_context_ptr: **anyopaque,
 ) void;
@@ -116,12 +115,14 @@ const StackContext = switch (builtin.cpu.arch) {
 };
 
 const Intel_Microsoft = struct {
-    pub const word_count = 30;
+    pub const word_count = 31;
+
+    pub const entry_offset = word_count - 1;
 
     comptime {
-        asm(
-            \\.global __fiber_stack_swap
-            \\__fiber_stack_swap:
+        asm (
+            \\.global zefi_stack_swap
+            \\zefi_stack_swap:
             \\  pushq %gs:0x10
             \\  pushq %gs:0x08
             \\
@@ -179,12 +180,14 @@ const Intel_Microsoft = struct {
 };
 
 const Intel_SysV = struct {
-    pub const word_count = 6;
+    pub const word_count = 7;
+
+    pub const entry_offset = word_count - 1;
 
     comptime {
-        asm(
-            \\.global __fiber_stack_swap
-            \\__fiber_stack_swap:
+        asm (
+            \\.global zefi_stack_swap
+            \\zefi_stack_swap:
             \\  pushq %rbx
             \\  pushq %rbp
             \\  pushq %r12
@@ -210,40 +213,40 @@ const Intel_SysV = struct {
 const Arm_64 = struct {
     pub const word_count = 20;
 
+    pub const entry_offset = 0;
+
     comptime {
-        asm(
-            \\.global __fiber_stack_swap
-            \\__fiber_stack_swap:
-            \\  stp d8, d9, [sp, #-20*8]!
-            \\  stp d10, d11, [sp, #2*8]
-            \\  stp d12, d13, [sp, #4*8]
-            \\  stp d14, d15, [sp, #6*8]
-            \\  stp x19, x20, [sp, #8*8]
-            \\  stp x21, x22, [sp, #10*8]
-            \\  stp x23, x24, [sp, #12*8]
-            \\  stp x25, x26, [sp, #14*8]
-            \\  stp x27, x28, [sp, #16*8]
-            \\  stp x29, x30, [sp, #18*8]
+        asm (
+            \\.global _zefi_stack_swap
+            \\_zefi_stack_swap:
+            \\  stp lr, fp, [sp, #-20*8]!
+            \\  stp d8, d9, [sp, #2*8]
+            \\  stp d10, d11, [sp, #4*8]
+            \\  stp d12, d13, [sp, #6*8]
+            \\  stp d14, d15, [sp, #8*8]
+            \\  stp x19, x20, [sp, #10*8]
+            \\  stp x21, x22, [sp, #12*8]
+            \\  stp x23, x24, [sp, #14*8]
+            \\  stp x25, x26, [sp, #16*8]
+            \\  stp x27, x28, [sp, #18*8]
             \\
-            \\  mov x16, sp
-            \\  str x16, [x0]
-            \\  ldr x16, [x1]
-            \\  mov sp, x16
+            \\  mov x9, sp
+            \\  str x9, [x0]
+            \\  ldr x9, [x1]
+            \\  mov sp, x9
             \\
-            \\  ldp x29, x30, [sp, #18*8]
-            \\  ldp x27, x28, [sp, #16*8]
-            \\  ldp x25, x26, [sp, #14*8]
-            \\  ldp x23, x24, [sp, #12*8]
-            \\  ldp x21, x22, [sp, #10*8]
-            \\  ldp x19, x20, [sp, #8*8]
-            \\  ldp d14, d15, [sp, #6*8]
-            \\  ldp d12, d13, [sp, #4*8]
-            \\  ldp d10, d11, [sp, #2*8]
-            \\  ldp d8, d9, [sp], #20*8
-            \\
-            \\  mov x16, lr
-            \\  mov lr, zxr
-            \\  ret x16
+            \\  ldp x27, x28, [sp, #18*8]
+            \\  ldp x25, x26, [sp, #16*8]
+            \\  ldp x23, x24, [sp, #14*8]
+            \\  ldp x21, x22, [sp, #12*8]
+            \\  ldp x19, x20, [sp, #10*8]
+            \\  ldp d14, d15, [sp, #8*8]
+            \\  ldp d12, d13, [sp, #6*8]
+            \\  ldp d10, d11, [sp, #4*8]
+            \\  ldp d8, d9, [sp, #2*8]
+            \\  ldp lr, fp, [sp], #20*8
+            \\  
+            \\  ret
         );
     }
 };
