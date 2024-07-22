@@ -19,54 +19,54 @@ pub fn init(stack: []u8, user_data: usize, comptime func: anytype, args: anytype
             const state = tls_state orelse unreachable;
 
             // Call the functions with the args.
-            const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
+            const args_ptr = @as(*align(1) Args, @ptrFromInt(@intFromPtr(state) - @sizeOf(Args)));
             @call(.auto, func, args_ptr.*);
 
-            // Mark the fiber as completed and do one last 
+            // Mark the fiber as completed and do one last
             zefi_stack_swap(&state.stack_context, &state.caller_context);
             unreachable;
         }
     }.entry);
 
-    const args_ptr = @intToPtr(*align(1) Args, @ptrToInt(state) - @sizeOf(Args));
+    const args_ptr = @as(*align(1) Args, @ptrFromInt(@intFromPtr(state) - @sizeOf(Args)));
     args_ptr.* = args;
 
-    return @ptrCast(*Fiber, state);
+    return @ptrCast(state);
 }
 
 threadlocal var tls_state: ?*State = null;
 
 /// Get the currently running fiber of the caller, if any.
 pub inline fn current() ?*Fiber {
-    return @ptrCast(?*Fiber, tls_state);
+    return @ptrCast(tls_state);
 }
 
 /// Given a fiber, return the stack memory used to initialize it.
 /// Calling getStack() on a fiber which has completed is unspecified behavior.
 pub fn getStack(fiber: *Fiber) []u8 {
-    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+    const state = @as(*State, @ptrCast(@alignCast(fiber)));
 
-    const stack_end = @ptrToInt(state) + @truncate(u8, state.offset);
+    const stack_end = @intFromPtr(state) + @as(u8, @truncate(state.offset));
     const stack_base = stack_end - (state.offset >> @bitSizeOf(u8));
-    return @ptrCast([*]u8, stack_base)[0..(stack_end - stack_base)];
+    return @as([*]u8, @ptrCast(stack_base))[0..(stack_end - stack_base)];
 }
 
 /// Given a fiber, return the user_data used to initialize it.
 /// A pointer to the user_data is returned to give the caller the ability to modify it on the Fiber.
 /// Calling getUserDataPtr() on a fiber which has completed is unspecified behavior.
 pub fn getUserDataPtr(fiber: *Fiber) *usize {
-    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+    const state = @as(*State, @ptrCast(@alignCast(fiber)));
     return &state.user_data;
 }
 
 /// Switches the current thread's execution state from the caller's to the fiber's.
 /// The fiber will return back to this caller either through yield or completing its init function.
 /// The fiber must either be newly initialized or previously yielded.
-/// 
+///
 /// Switching to a fiber that is currently executing is undefined behavior.
 /// Switching to a fiber that has completed is illegal behavior.
 pub fn switchTo(fiber: *Fiber) void {
-    const state = @ptrCast(*State, @alignCast(@alignOf(State), fiber));
+    const state = @as(*State, @ptrCast(@alignCast(fiber)));
 
     // Temporarily set the current fiber to the one passed in for the duration of the stack swap.
     const old_state = tls_state;
@@ -79,8 +79,8 @@ pub fn switchTo(fiber: *Fiber) void {
 
 /// Switches the current thread's execution back to the most recent switchTo() called on the currently running fiber.
 /// Calling yield from outside a fiber context (`current() == null`) is illegal behavior.
-/// Once execution is yielded back, switchTo() on the (now previous) current fiber can be called again 
-/// to continue the fiber from this yield point. 
+/// Once execution is yielded back, switchTo() on the (now previous) current fiber can be called again
+/// to continue the fiber from this yield point.
 pub fn yield() void {
     const state = tls_state orelse unreachable;
     zefi_stack_swap(&state.stack_context, &state.caller_context);
@@ -93,8 +93,8 @@ const State = extern struct {
     offset: usize,
 
     fn init(stack: []u8, user_data: usize, args_size: usize, entry_point: *const fn () callconv(.C) noreturn) Error!*State {
-        const stack_base = @ptrToInt(stack.ptr);
-        const stack_end = @ptrToInt(stack.ptr + stack.len);
+        const stack_base = @intFromPtr(stack.ptr);
+        const stack_end = @intFromPtr(stack.ptr + stack.len);
         if (stack.len > (std.math.maxInt(usize) >> @bitSizeOf(u8))) return error.StackTooLarge;
 
         // Push the State onto the state.
@@ -102,7 +102,7 @@ const State = extern struct {
         stack_ptr = std.mem.alignBackward(usize, stack_ptr, @alignOf(State));
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
-        const state = @intToPtr(*State, stack_ptr);
+        const state = @as(*State, @ptrFromInt(stack_ptr));
         const end_offset = stack_end - stack_ptr;
 
         // Push enough bytes for the args onto the stack.
@@ -119,11 +119,11 @@ const State = extern struct {
         if (stack_ptr < stack_base) return error.StackTooSmall;
 
         // Write the entry point into the StackContext.
-        @intToPtr([*]@TypeOf(entry_point), stack_ptr)[StackContext.entry_offset] = entry_point;
+        @as([*]@TypeOf(entry_point), @ptrFromInt(stack_ptr))[StackContext.entry_offset] = entry_point;
 
         state.* = .{
             .caller_context = undefined,
-            .stack_context = @intToPtr(*anyopaque, stack_ptr),
+            .stack_context = @as(*anyopaque, @ptrFromInt(stack_ptr)),
             .user_data = user_data,
             .offset = (stack.len << @bitSizeOf(u8)) | end_offset,
         };
@@ -205,10 +205,15 @@ const Intel_Microsoft = struct {
             \\
             \\  popq %gs:0x08
             \\  popq %gs:0x10
-            \\  
+            \\
             \\  retq
         );
     }
+};
+
+const symbol = switch (builtin.target.os.tag) {
+    .macos => "_zefi_stack_swap",
+    else => "zefi_stack_swap",
 };
 
 const Intel_SysV = struct {
@@ -217,28 +222,28 @@ const Intel_SysV = struct {
     pub const entry_offset = word_count - 1;
 
     comptime {
-        asm (
-            \\.global zefi_stack_swap
-            \\zefi_stack_swap:
-            \\  pushq %rbx
-            \\  pushq %rbp
-            \\  pushq %r12
-            \\  pushq %r13
-            \\  pushq %r14
-            \\  pushq %r15
-            \\
-            \\  movq %rsp, (%rdi)
-            \\  movq (%rsi), %rsp
-            \\
-            \\  popq %r15
-            \\  popq %r14
-            \\  popq %r13
-            \\  popq %r12
-            \\  popq %rbp
-            \\  popq %rbx
-            \\
-            \\  retq
-        );
+        asm (std.fmt.comptimePrint(
+                \\.global {[symbol]s}
+                \\{[symbol]s}:
+                \\  pushq %rbx
+                \\  pushq %rbp
+                \\  pushq %r12
+                \\  pushq %r13
+                \\  pushq %r14
+                \\  pushq %r15
+                \\
+                \\  movq %rsp, (%rdi)
+                \\  movq (%rsi), %rsp
+                \\
+                \\  popq %r15
+                \\  popq %r14
+                \\  popq %r13
+                \\  popq %r12
+                \\  popq %rbp
+                \\  popq %rbx
+                \\
+                \\  retq
+            , .{ .symbol = symbol }));
     }
 };
 
@@ -248,37 +253,37 @@ const Arm_64 = struct {
     pub const entry_offset = 0;
 
     comptime {
-        asm (
-            \\.global _zefi_stack_swap
-            \\_zefi_stack_swap:
-            \\  stp lr, fp, [sp, #-20*8]!
-            \\  stp d8, d9, [sp, #2*8]
-            \\  stp d10, d11, [sp, #4*8]
-            \\  stp d12, d13, [sp, #6*8]
-            \\  stp d14, d15, [sp, #8*8]
-            \\  stp x19, x20, [sp, #10*8]
-            \\  stp x21, x22, [sp, #12*8]
-            \\  stp x23, x24, [sp, #14*8]
-            \\  stp x25, x26, [sp, #16*8]
-            \\  stp x27, x28, [sp, #18*8]
-            \\
-            \\  mov x9, sp
-            \\  str x9, [x0]
-            \\  ldr x9, [x1]
-            \\  mov sp, x9
-            \\
-            \\  ldp x27, x28, [sp, #18*8]
-            \\  ldp x25, x26, [sp, #16*8]
-            \\  ldp x23, x24, [sp, #14*8]
-            \\  ldp x21, x22, [sp, #12*8]
-            \\  ldp x19, x20, [sp, #10*8]
-            \\  ldp d14, d15, [sp, #8*8]
-            \\  ldp d12, d13, [sp, #6*8]
-            \\  ldp d10, d11, [sp, #4*8]
-            \\  ldp d8, d9, [sp, #2*8]
-            \\  ldp lr, fp, [sp], #20*8
-            \\  
-            \\  ret
-        );
+        asm (std.fmt.comptimePrint(
+                \\.global {[symbol]s}
+                \\{[symbol]s}:
+                \\  stp lr, fp, [sp, #-20*8]!
+                \\  stp d8, d9, [sp, #2*8]
+                \\  stp d10, d11, [sp, #4*8]
+                \\  stp d12, d13, [sp, #6*8]
+                \\  stp d14, d15, [sp, #8*8]
+                \\  stp x19, x20, [sp, #10*8]
+                \\  stp x21, x22, [sp, #12*8]
+                \\  stp x23, x24, [sp, #14*8]
+                \\  stp x25, x26, [sp, #16*8]
+                \\  stp x27, x28, [sp, #18*8]
+                \\
+                \\  mov x9, sp
+                \\  str x9, [x0]
+                \\  ldr x9, [x1]
+                \\  mov sp, x9
+                \\
+                \\  ldp x27, x28, [sp, #18*8]
+                \\  ldp x25, x26, [sp, #16*8]
+                \\  ldp x23, x24, [sp, #14*8]
+                \\  ldp x21, x22, [sp, #12*8]
+                \\  ldp x19, x20, [sp, #10*8]
+                \\  ldp d14, d15, [sp, #8*8]
+                \\  ldp d12, d13, [sp, #6*8]
+                \\  ldp d10, d11, [sp, #4*8]
+                \\  ldp d8, d9, [sp, #2*8]
+                \\  ldp lr, fp, [sp], #20*8
+                \\
+                \\  ret
+            , .{ .symbol = symbol }));
     }
 };

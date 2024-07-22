@@ -45,12 +45,12 @@ pub fn main() !void {
     const f1_stack = try allocator.alloc(u8, 16 * 1024);
     defer allocator.free(f1_stack);
 
-    var fiber_2 = try Fiber.init(f2_stack, 0x420, hello2, .{&val});
+    const fiber_2 = try Fiber.init(f2_stack, 0x420, hello2, .{&val});
     var fiber = try Fiber.init(f1_stack, 0x1337, hello, .{ &val, fiber_2 });
 
     val = 5;
     fiber.switchTo();
-    
+
     val += 7;
     fiber.switchTo();
 }
